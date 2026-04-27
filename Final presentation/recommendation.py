@@ -125,7 +125,7 @@ def recommend(
     movie_title: str,
     num_recommendations: int = 10,
     with_scores: bool = False,
-    with_tags: bool = False,
+    with_tags: bool = False, 
 ):
     """
     Recommend movies whose genre/keyword profile is closest in cosine space.
