@@ -1,11 +1,29 @@
 # Content-based movie recommendations (Netflix-style: similar titles from taste text).
 # Uses TF-IDF over genres + keywords from TMDB-style data.
+#
+# Model build is deferred until the first recommend() call (fast import).
+# After the first build, a joblib cache speeds up the next runs unless CSVs change.
 import ast
-import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+from pathlib import Path
 
-from movies import movies_keywords
+import joblib # Saves the model to make it faster to load
+import pandas as pd # Data manipulation
+from sklearn.feature_extraction.text import TfidfVectorizer # Convert words into numbers
+from sklearn.metrics.pairwise import cosine_similarity # Compares how two movies are similar
+
+_DIR = Path(__file__).resolve().parent
+_CACHE_PATH = _DIR / "recommendation_model.joblib"
+# Rebuild cache if any of these are newer than the cache file
+_CACHE_DEPS = (
+    _DIR / "movies_metadata.csv",
+    _DIR / "keywords.csv",
+    _DIR / "movies.py",
+    Path(__file__).resolve(),
+)
+
+movies = None
+_vectorizer = None
+_tfidf_matrix = None
 
 
 def _parse_json_name_list(text):
@@ -29,24 +47,68 @@ def _prepare_movies(df: pd.DataFrame) -> pd.DataFrame:
     out = df.dropna(subset=["title"]).copy()
     out["genres_list"] = out["genres"].apply(_parse_json_name_list)
     out["keywords_list"] = out["keywords"].apply(_parse_json_name_list)
-    out["combined"] = out.apply(
-        lambda row: " ".join(row["genres_list"] + row["keywords_list"]).lower(),
-        axis=1,
-    )
+    gl, kl = out["genres_list"].tolist(), out["keywords_list"].tolist()
+    out["combined"] = [" ".join(g + k).lower() for g, k in zip(gl, kl)]
     out = out[out["combined"].str.len() > 0].reset_index(drop=True)
     return out
 
 
-movies = _prepare_movies(movies_keywords)
+def _cache_fresh() -> bool: # Checks if the cache is fresh
+    if not _CACHE_PATH.is_file():
+        return False
+    cache_mtime = _CACHE_PATH.stat().st_mtime
+    for p in _CACHE_DEPS:
+        if p.is_file() and p.stat().st_mtime > cache_mtime:
+            return False
+    return True
 
-# English stop words + light n-grams help match phrasing like "dark knight" / "crime drama"
-_vectorizer = TfidfVectorizer(
-    stop_words="english",
-    min_df=2,
-    ngram_range=(1, 2),
-    max_features=50000,
-)
-_tfidf_matrix = _vectorizer.fit_transform(movies["combined"])
+
+def _load_from_cache():
+    global movies, _vectorizer, _tfidf_matrix
+    blob = joblib.load(_CACHE_PATH)
+    movies = blob["movies"]
+    _vectorizer = blob["vectorizer"]
+    _tfidf_matrix = blob["matrix"]
+
+
+def _build_and_save_cache(): 
+    global movies, _vectorizer, _tfidf_matrix
+    from movies import movies_keywords as _mk
+
+    movies = _prepare_movies(_mk)
+    _vectorizer = TfidfVectorizer(
+        stop_words="english",
+        min_df=2,
+        ngram_range=(1, 2),
+        max_features=50000,
+    )
+    _tfidf_matrix = _vectorizer.fit_transform(movies["combined"]) # Every movie is a point
+    joblib.dump(
+        {"movies": movies, "vectorizer": _vectorizer, "matrix": _tfidf_matrix},
+        _CACHE_PATH,
+    )
+
+
+def ensure_model(*, verbose: bool = False) -> None:
+    """
+    Build or load the TF-IDF index (first call is slow; later calls use cache).
+    Call this if you want to warm the model without running recommend().
+    """
+    global movies, _vectorizer, _tfidf_matrix
+    if _tfidf_matrix is not None:
+        return
+    if _cache_fresh():
+        if verbose:
+            print(f"Loading model from cache ({_CACHE_PATH.name}) ...")
+        _load_from_cache()
+        if verbose:
+            print(f"Ready ({len(movies):,} movies).")
+        return
+    if verbose:
+        print("Building TF-IDF index (first time or data changed); this can take ~30-90s ...")
+    _build_and_save_cache()
+    if verbose:
+        print(f"Saved cache to {_CACHE_PATH.name}. Ready ({len(movies):,} movies).")
 
 
 def _format_names(label: str, names: list, max_show: int = 30) -> str:
@@ -80,6 +142,8 @@ def recommend(
         If True with with_scores, each item is (title, score, genres_list, keywords_list).
         Ignored unless with_scores is True.
     """
+    ensure_model(verbose=False)
+
     title_key = movie_title.strip().lower()
     mask = movies["title"].str.lower().str.strip() == title_key
     if not mask.any():
@@ -89,12 +153,10 @@ def recommend(
             return [("Movie not found in dataset", 0.0)]
         return ["Movie not found in dataset"]
 
-    # Row position in `movies` / _tfidf_matrix (0 .. n-1)
     idx = int(movies[mask].index[0])
 
-    # One row vs all columns — avoids building an n×n similarity matrix (too large for ~45k films)
-    sims = cosine_similarity(_tfidf_matrix[idx : idx + 1], _tfidf_matrix).ravel()
-    ranked = sorted(enumerate(sims), key=lambda x: x[1], reverse=True)
+    sims = cosine_similarity(_tfidf_matrix[idx : idx + 1], _tfidf_matrix).ravel() # Compares how similar the movie is to the other movies
+    ranked = sorted(enumerate(sims), key=lambda x: x[1], reverse=True) # Sorts the movies by how similar they are to the seed movie
 
     results = []
     for row_i, score in ranked[1 : num_recommendations + 1]:
@@ -126,6 +188,8 @@ if __name__ == "__main__":
     if not movie_name:
         print("No title entered. Exiting.")
         raise SystemExit(0)
+
+    ensure_model(verbose=True)
 
     print(f"\nRecommendations for '{movie_name}' (content-based, genres + keywords)\n")
 
